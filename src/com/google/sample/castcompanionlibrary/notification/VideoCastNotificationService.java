@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2013 Google Inc. All Rights Reserved.
+ * Copyright (C) 2014 Google Inc. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ import com.google.sample.castcompanionlibrary.utils.FetchBitmapTask;
 import com.google.sample.castcompanionlibrary.utils.LogUtils;
 import com.google.sample.castcompanionlibrary.utils.Utils;
 
+import android.annotation.TargetApi;
 import android.app.Notification;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
@@ -75,9 +76,11 @@ public class VideoCastNotificationService extends Service {
     private Class<?> mTargetActivity;
     private String mDataNamespace;
     private int mStatus;
+    private int mOldStatus = -1;
     private Notification mNotification;
     private boolean mVisible;
     boolean mIsIcsOrAbove = Build.VERSION.SDK_INT >= Build.VERSION_CODES.ICE_CREAM_SANDWICH;
+    boolean mIsLollipopOrAbove = Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP;
     private VideoCastManager mCastManager;
     private VideoCastConsumerImpl mConsumer;
     private FetchBitmapTask mBitmapDecoderTask;
@@ -90,7 +93,7 @@ public class VideoCastNotificationService extends Service {
         mCastManager = VideoCastManager
                 .initialize(this, mApplicationId, mTargetActivity, mDataNamespace);
         if (!mCastManager.isConnected() && !mCastManager.isConnecting()) {
-            mCastManager.reconnectSessionIfPossible(this, false);
+            mCastManager.reconnectSessionIfPossible();
         }
         mConsumer = new VideoCastConsumerImpl() {
             @Override
@@ -111,7 +114,6 @@ public class VideoCastNotificationService extends Service {
                 mVisible = !visible;
                 if (mVisible && null != mNotification) {
                     startForeground(NOTIFICATION_ID, mNotification);
-                    mCastManager.setContext(VideoCastNotificationService.this);
                 } else {
                     stopForeground(true);
                 }
@@ -140,9 +142,18 @@ public class VideoCastNotificationService extends Service {
             } else if (ACTION_VISIBILITY.equals(action)) {
                 mVisible = intent.getBooleanExtra(NOTIFICATION_VISIBILITY, false);
                 LOGD(TAG, "onStartCommand(): Action: ACTION_VISIBILITY " + mVisible);
-                if (mVisible && null != mNotification) {
-                    startForeground(NOTIFICATION_ID, mNotification);
-                    mCastManager.setContext(this);
+                if (mVisible) {
+                    if (mNotification != null) {
+                        startForeground(NOTIFICATION_ID, mNotification);
+                    } else {
+                        try {
+                            setupNotification(mCastManager.getRemoteMediaInformation());
+                        } catch (TransientNetworkDisconnectionException e) {
+                            LOGE(TAG, "onStartCommand() failed to get media", e);
+                        } catch (NoConnectionException e) {
+                            LOGE(TAG, "onStartCommand() failed to get media", e);
+                        }
+                    }
                 } else {
                     stopForeground(true);
                 }
@@ -181,11 +192,11 @@ public class VideoCastNotificationService extends Service {
             LOGE(TAG, "Failed to build notification");
         }
 
-        mBitmapDecoderTask = new FetchBitmapTask() {
+        mBitmapDecoderTask = new FetchBitmapTask(400, 400) {
             @Override
             protected void onPostExecute(Bitmap bitmap) {
                 try {
-                    mVideoArtBitmap = bitmap;
+                    mVideoArtBitmap = Utils.scaleCenterCrop(bitmap, 256, 256);
                     build(info, mVideoArtBitmap, mIsPlaying);
                 } catch (CastException e) {
                     LOGE(TAG, "Failed to set notification for " + info.toString(), e);
@@ -215,7 +226,12 @@ public class VideoCastNotificationService extends Service {
 
     private void onRemoteMediaPlayerStatusUpdated(int mediaStatus) {
         mStatus = mediaStatus;
-        LOGD(TAG, "onRemoteMediaPlayerMetadataUpdated() reached with status: " + mStatus);
+        if (mOldStatus == mStatus) {
+            // not need to make any updates here
+            return;
+        }
+        mOldStatus = mStatus;
+        LOGD(TAG, "onRemoteMediaPlayerStatusUpdated() reached with status: " + mStatus);
         try {
             switch (mediaStatus) {
                 case MediaStatus.PLAYER_STATE_BUFFERING: // (== 4)
@@ -276,6 +292,10 @@ public class VideoCastNotificationService extends Service {
      */
     private RemoteViews build(MediaInfo info, Bitmap bitmap, boolean isPlaying)
             throws CastException, TransientNetworkDisconnectionException, NoConnectionException {
+        if (mIsLollipopOrAbove) {
+            buildForLollipopAndAbove(info, bitmap, isPlaying);
+            return null;
+        }
         Bundle mediaWrapper = Utils.fromMediaInfo(mCastManager.getRemoteMediaInformation());
         Intent contentIntent = new Intent(this, mTargetActivity);
 
@@ -324,6 +344,59 @@ public class VideoCastNotificationService extends Service {
         mNotification.contentView = rv;
 
         return rv;
+    }
+
+    @TargetApi(Build.VERSION_CODES.LOLLIPOP)
+    private void buildForLollipopAndAbove(MediaInfo info, Bitmap bitmap, boolean isPlaying)
+            throws CastException, TransientNetworkDisconnectionException, NoConnectionException {
+
+        // Playback PendingIntent
+        Intent playbackIntent = new Intent(ACTION_TOGGLE_PLAYBACK);
+        playbackIntent.setPackage(getPackageName());
+        PendingIntent playbackPendingIntent = PendingIntent
+                .getBroadcast(this, 0, playbackIntent, 0);
+
+        // Disconnect PendingIntent
+        Intent stopIntent = new Intent(ACTION_STOP);
+        stopIntent.setPackage(getPackageName());
+        PendingIntent stopPendingIntent = PendingIntent.getBroadcast(this, 0, stopIntent, 0);
+
+        // Main Content PendingIntent
+        Bundle mediaWrapper = Utils.fromMediaInfo(mCastManager.getRemoteMediaInformation());
+        Intent contentIntent = new Intent(this, mTargetActivity);
+        contentIntent.putExtra("media", mediaWrapper);
+
+        // Media metadata
+        MediaMetadata mm = info.getMetadata();
+        String castingTo = getResources().getString(R.string.casting_to_device,
+                mCastManager.getDeviceName());
+        TaskStackBuilder stackBuilder = TaskStackBuilder.create(this);
+        stackBuilder.addParentStack(mTargetActivity);
+        stackBuilder.addNextIntent(contentIntent);
+        if (stackBuilder.getIntentCount() > 1) {
+            stackBuilder.editIntentAt(1).putExtra("media", mediaWrapper);
+        }
+        PendingIntent contentPendingIntent =
+                stackBuilder.getPendingIntent(NOTIFICATION_ID, PendingIntent.FLAG_UPDATE_CURRENT);
+
+        mNotification = new Notification.Builder(this)
+                .setSmallIcon(R.drawable.ic_stat_action_notification)
+                .setContentTitle(mm.getString(MediaMetadata.KEY_TITLE))
+                .setContentText(castingTo)
+                .setContentIntent(contentPendingIntent)
+                .setLargeIcon(bitmap)
+                .addAction(isPlaying ? R.drawable.ic_pause_white_48dp :
+                                R.drawable.ic_play_arrow_white_48dp,
+                        getString(R.string.pause), playbackPendingIntent)
+                .addAction(R.drawable.ic_clear_white_24dp, getString(R.string.disconnect),
+                        stopPendingIntent)
+                .setStyle(new Notification.MediaStyle()
+                                .setShowActionsInCompactView(new int[]{0,1}))
+                .setOngoing(true)
+                .setShowWhen(false)
+                .setVisibility(Notification.VISIBILITY_PUBLIC)
+                .build();
+
     }
 
     private void addPendingIntents(RemoteViews rv, boolean isPlaying, MediaInfo info) {
