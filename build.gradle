@@ -14,14 +14,6 @@
  * limitations under the License.
  */
 
-buildscript {
-    repositories {
-        jcenter()
-    }
-    dependencies {
-        classpath 'com.android.tools.build:gradle:2.0.0-alpha1'
-    }
-}
 
 repositories {
     mavenCentral()
